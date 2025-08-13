@@ -1,94 +1,89 @@
-from fastapi import FastAPI, File, UploadFile
+# app.py
+from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
-from PIL import Image
+from fastapi.responses import JSONResponse
+from typing import List
 import numpy as np
 import tensorflow as tf
+from PIL import Image
 import faiss
 import io
 import os
 
-"""
-Application for matching images against a set of pre-defined markers using a MobileNetV2
-feature‑vector model.  The TensorFlow Lite interpreter is created once at startup using
-the provided `.tflite` model.  We import TensorFlow as `tf` and use `tf.lite.Interpreter`
-to avoid the `NameError` that occurred when referencing an undefined `tflite` module.
-
-If you later migrate to the new LiteRT interpreter, install `ai-edge-litert` and
-replace `tf.lite.Interpreter` with `ai_edge_litert.Interpreter` accordingly.  The
-current usage remains valid for TensorFlow versions prior to the deprecation.
-"""
+# Constants
+MODEL_PATH = "mobilenetv2.tflite"
+MARKER_DIR = "markers"
 
 app = FastAPI()
 
-# Allow frontend requests
+# Allow frontend access
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Path to the TensorFlow Lite model
-# Use the uploaded MobilenetV2 feature vector model.  Only one path is defined to avoid
-# confusion; update this string if you deploy a different filename.
-MODEL_PATH = "mobilenetv2.tflite"
-
-# Initialise the TensorFlow Lite interpreter.  We use tf.lite.Interpreter rather than
-# an undefined `tflite` symbol to avoid a NameError at runtime.  Allocate tensors
-# immediately so that input/output details are available.
+# Load TFLite model
 interpreter = tf.lite.Interpreter(model_path=MODEL_PATH)
 interpreter.allocate_tensors()
 input_details = interpreter.get_input_details()
 output_details = interpreter.get_output_details()
 
-# Example markers (replace with your actual files)
-marker_files = {
-    "marker1": "markers/Shree_Ganesh_Marker_01.jpg",
-    "marker2": "markers/Shree_Ganesh_Marker_02.jpg"
-}
-marker_animations = {
-    "marker1": "animations/Ganesha_Test01.json",
-    "marker2": "animations/Ganesha_Test01.json"
-}
-
-# Preprocess function
-def preprocess_image(image_source):
-    if isinstance(image_source, bytes):
-        img = Image.open(io.BytesIO(image_source)).convert("RGB")
-    else:
-        img = Image.open(image_source).convert("RGB")
-    img = img.resize((224, 224))
-    arr = np.array(img, dtype=np.float32)
-    arr = (arr / 127.5) - 1.0  # MobileNetV2 normalization
+# Helper: preprocess image to 224x224 RGB normalized
+def preprocess(image: Image.Image) -> np.ndarray:
+    image = image.resize((224, 224)).convert("RGB")
+    arr = np.array(image).astype(np.float32)
+    arr = arr / 127.5 - 1.0  # Normalize
     return np.expand_dims(arr, axis=0)
 
-# Run inference to get embedding
-def get_embedding(img_array):
-    interpreter.set_tensor(input_details[0]['index'], img_array)
+# Helper: extract embedding from image
+def get_embedding(image: Image.Image) -> np.ndarray:
+    input_tensor = preprocess(image)
+    interpreter.set_tensor(input_details[0]['index'], input_tensor)
     interpreter.invoke()
-    output_data = interpreter.get_tensor(output_details[0]['index'])
-    return output_data
+    output = interpreter.get_tensor(output_details[0]['index'])
+    return output.flatten()
+
+# Load and vectorize all markers
+marker_vectors = []
+marker_names = []
+for filename in os.listdir(MARKER_DIR):
+    if filename.lower().endswith(('.jpg', '.jpeg', '.png')):
+        path = os.path.join(MARKER_DIR, filename)
+        img = Image.open(path)
+        vec = get_embedding(img)
+        marker_vectors.append(vec)
+        marker_names.append(filename)
 
 # Build FAISS index
-d = 1280
+d = len(marker_vectors[0]) if marker_vectors else 1280
 index = faiss.IndexFlatL2(d)
-marker_labels = []
+if marker_vectors:
+    index.add(np.array(marker_vectors))
 
-for label, path in marker_files.items():
-    arr = preprocess_image(path)
-    vec = get_embedding(arr)
-    index.add(vec)
-    marker_labels.append(label)
-
-@app.post("/match")
+@app.post("/")
 async def match_marker(file: UploadFile = File(...)):
-    image_bytes = await file.read()
-    arr = preprocess_image(image_bytes)
-    vec = get_embedding(arr)
-    D, I = index.search(vec, 1)
-    best_label = marker_labels[I[0][0]]
-    return {
-        "marker_id": best_label,
-        "animation_url": marker_animations[best_label],
-        "distance": float(D[0][0])
-    }
+    img_bytes = await file.read()
+    img = Image.open(io.BytesIO(img_bytes))
+    vec = get_embedding(img)
+
+    if not index.ntotal:
+        return {"error": "No markers indexed."}
+
+    D, I = index.search(np.array([vec]), k=1)
+    best_match_idx = I[0][0]
+    distance = D[0][0]
+
+    # Set threshold for match (adjust as needed)
+    if distance < 1.0:
+        marker_id = marker_names[best_match_idx]
+        animation_url = "https://assets2.lottiefiles.com/packages/lf20_puciaact.json"
+        return {"marker_id": marker_id, "animation_url": animation_url}
+    else:
+        return {"marker_id": None, "message": "No match found"}
+
+@app.get("/")
+def health_check():
+    return {"status": "Backend is running"}
