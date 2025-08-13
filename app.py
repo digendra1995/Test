@@ -3,13 +3,20 @@ from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image
 import numpy as np
 import tensorflow as tf
-
-MODEL_PATH = "mobilenetv2.tflite"
-interpreter = tf.lite.Interpreter(model_path=MODEL_PATH)
-interpreter.allocate_tensors()
 import faiss
 import io
 import os
+
+"""
+Application for matching images against a set of pre-defined markers using a MobileNetV2
+feature‑vector model.  The TensorFlow Lite interpreter is created once at startup using
+the provided `.tflite` model.  We import TensorFlow as `tf` and use `tf.lite.Interpreter`
+to avoid the `NameError` that occurred when referencing an undefined `tflite` module.
+
+If you later migrate to the new LiteRT interpreter, install `ai-edge-litert` and
+replace `tf.lite.Interpreter` with `ai_edge_litert.Interpreter` accordingly.  The
+current usage remains valid for TensorFlow versions prior to the deprecation.
+"""
 
 app = FastAPI()
 
@@ -21,9 +28,15 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Load TFLite MobileNetV2 model
-MODEL_PATH = "mobilenet_v2.tflite"
-interpreter = tflite.Interpreter(model_path=MODEL_PATH)
+# Path to the TensorFlow Lite model
+# Use the uploaded MobilenetV2 feature vector model.  Only one path is defined to avoid
+# confusion; update this string if you deploy a different filename.
+MODEL_PATH = "mobilenetv2.tflite"
+
+# Initialise the TensorFlow Lite interpreter.  We use tf.lite.Interpreter rather than
+# an undefined `tflite` symbol to avoid a NameError at runtime.  Allocate tensors
+# immediately so that input/output details are available.
+interpreter = tf.lite.Interpreter(model_path=MODEL_PATH)
 interpreter.allocate_tensors()
 input_details = interpreter.get_input_details()
 output_details = interpreter.get_output_details()
