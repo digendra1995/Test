@@ -3,6 +3,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image
 import numpy as np
 import tensorflow as tf
+
+MODEL_PATH = "mobilenetv2.tflite"
+interpreter = tf.lite.Interpreter(model_path=MODEL_PATH)
+interpreter.allocate_tensors()
 import faiss
 import io
 import os
