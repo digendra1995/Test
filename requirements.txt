@@ -2,4 +2,4 @@ fastapi
 uvicorn
 pillow
 faiss-cpu
-tensorflow-cpu==2.16.1
+tensorflow-cpu
