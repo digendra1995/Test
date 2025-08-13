@@ -26,12 +26,12 @@ output_details = interpreter.get_output_details()
 
 # Example markers (replace with your actual files)
 marker_files = {
-    "marker1": "markers/marker1.jpg",
-    "marker2": "markers/marker2.jpg"
+    "marker1": "markers/Shree_Ganesh_Marker_01.jpg",
+    "marker2": "markers/Shree_Ganesh_Marker_02.jpg"
 }
 marker_animations = {
-    "marker1": "animations/ganesha.json",
-    "marker2": "animations/elephant.json"
+    "marker1": "animations/Ganesha_Test01.json",
+    "marker2": "animations/Ganesha_Test01.json"
 }
 
 # Preprocess function
