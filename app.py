@@ -7,6 +7,7 @@ import numpy as np
 from PIL import Image
 import os
 import uuid
+import io
 
 app = FastAPI()
 
@@ -60,7 +61,7 @@ app.mount("/markers", StaticFiles(directory=MARKER_DIR), name="markers")
 async def match_image(file: UploadFile = File(...)):
     try:
         contents = await file.read()
-        image = Image.open(tf.io.BytesIO(contents)).convert("RGB").resize((224, 224))
+        image = Image.open(io.BytesIO(contents)).convert("RGB").resize((224, 224))
         img_array = np.array(image, dtype=np.float32)
         img_array = tf.keras.applications.mobilenet_v2.preprocess_input(img_array)
         img_array = np.expand_dims(img_array, axis=0)
