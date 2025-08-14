@@ -1,22 +1,16 @@
-# app.py
 from fastapi import FastAPI, UploadFile, File
-from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from typing import List
-import numpy as np
+from fastapi.staticfiles import StaticFiles
+from fastapi.middleware.cors import CORSMiddleware
 import tensorflow as tf
+import numpy as np
 from PIL import Image
-import faiss
-import io
 import os
-
-# Constants
-MODEL_PATH = "mobilenetv2.tflite"
-MARKER_DIR = "markers"
+import uuid
 
 app = FastAPI()
 
-# Allow frontend access
+# Allow frontend to access backend
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -25,65 +19,84 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+MODEL_PATH = "mobilenetv2.tflite"
+MARKER_DIR = "markers"
+
 # Load TFLite model
 interpreter = tf.lite.Interpreter(model_path=MODEL_PATH)
 interpreter.allocate_tensors()
 input_details = interpreter.get_input_details()
 output_details = interpreter.get_output_details()
 
-# Helper: preprocess image to 224x224 RGB normalized
-def preprocess(image: Image.Image) -> np.ndarray:
-    image = image.resize((224, 224)).convert("RGB")
-    arr = np.array(image).astype(np.float32)
-    arr = arr / 127.5 - 1.0  # Normalize
-    return np.expand_dims(arr, axis=0)
+# Create marker embeddings
+def load_image_embedding(image_path):
+    image = Image.open(image_path).convert("RGB").resize((224, 224))
+    img_array = np.array(image, dtype=np.float32)
+    img_array = tf.keras.applications.mobilenet_v2.preprocess_input(img_array)
+    img_array = np.expand_dims(img_array, axis=0)
 
-# Helper: extract embedding from image
-def get_embedding(image: Image.Image) -> np.ndarray:
-    input_tensor = preprocess(image)
-    interpreter.set_tensor(input_details[0]['index'], input_tensor)
+    interpreter.set_tensor(input_details[0]['index'], img_array)
     interpreter.invoke()
-    output = interpreter.get_tensor(output_details[0]['index'])
-    return output.flatten()
+    output_data = interpreter.get_tensor(output_details[0]['index'])
+    return output_data[0]
 
-# Load and vectorize all markers
-marker_vectors = []
-marker_names = []
+marker_embeddings = {}
+marker_images = []
+
 for filename in os.listdir(MARKER_DIR):
-    if filename.lower().endswith(('.jpg', '.jpeg', '.png')):
+    if filename.lower().endswith((".jpg", ".jpeg", ".png")):
         path = os.path.join(MARKER_DIR, filename)
-        img = Image.open(path)
-        vec = get_embedding(img)
-        marker_vectors.append(vec)
-        marker_names.append(filename)
+        embedding = load_image_embedding(path)
+        marker_embeddings[filename] = embedding
+        marker_images.append(filename)
 
-# Build FAISS index
-d = len(marker_vectors[0]) if marker_vectors else 1280
-index = faiss.IndexFlatL2(d)
-if marker_vectors:
-    index.add(np.array(marker_vectors))
+print(f"Loaded {len(marker_embeddings)} markers.")
 
+# Serve static marker images
+app.mount("/markers", StaticFiles(directory=MARKER_DIR), name="markers")
+
+# Main match endpoint
 @app.post("/")
-async def match_marker(file: UploadFile = File(...)):
-    img_bytes = await file.read()
-    img = Image.open(io.BytesIO(img_bytes))
-    vec = get_embedding(img)
+async def match_image(file: UploadFile = File(...)):
+    try:
+        contents = await file.read()
+        image = Image.open(tf.io.BytesIO(contents)).convert("RGB").resize((224, 224))
+        img_array = np.array(image, dtype=np.float32)
+        img_array = tf.keras.applications.mobilenet_v2.preprocess_input(img_array)
+        img_array = np.expand_dims(img_array, axis=0)
 
-    if not index.ntotal:
-        return {"error": "No markers indexed."}
+        interpreter.set_tensor(input_details[0]['index'], img_array)
+        interpreter.invoke()
+        input_embedding = interpreter.get_tensor(output_details[0]['index'])[0]
 
-    D, I = index.search(np.array([vec]), k=1)
-    best_match_idx = I[0][0]
-    distance = D[0][0]
+        best_match = None
+        best_distance = float('inf')
 
-    # Set threshold for match (adjust as needed)
-    if distance < 2.0:
-        marker_id = marker_names[best_match_idx]
-        animation_url = "https://assets2.lottiefiles.com/packages/lf20_puciaact.json"
-        return {"marker_id": marker_id, "animation_url": animation_url}
-    else:
-        return {"marker_id": None, "message": "No match found"}
+        for name, embedding in marker_embeddings.items():
+            distance = np.linalg.norm(embedding - input_embedding)
+            print(f"Compared with {name}, distance: {distance:.4f}")
+            if distance < best_distance:
+                best_distance = distance
+                best_match = name
 
-@app.get("/")
-def health_check():
-    return {"status": "Backend is running"}
+        if best_distance < 0.5:
+            return {
+                "marker_id": best_match,
+                "animation_url": "",  # Optional if using animation
+                "distance": round(float(best_distance), 4)
+            }
+        else:
+            return {
+                "marker_id": None,
+                "animation_url": None,
+                "distance": round(float(best_distance), 4)
+            }
+
+    except Exception as e:
+        print("Error processing image:", e)
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+# Endpoint to list marker image URLs
+@app.get("/markers")
+def get_marker_images():
+    return [f"/markers/{img}" for img in marker_images]
