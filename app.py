@@ -1,12 +1,13 @@
-from fastapi import FastAPI, UploadFile, File
-from fastapi.responses import JSONResponse, FileResponse
-from fastapi.middleware.cors import CORSMiddleware
-import numpy as np
-import tensorflow as tf
-from PIL import Image
 import os
+import numpy as np
+from fastapi import FastAPI, File, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from starlette.responses import JSONResponse
+from PIL import Image
+import tensorflow as tf
+import faiss
 import uuid
-import shutil
+from datetime import datetime
 
 app = FastAPI()
 
@@ -18,82 +19,93 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+MODEL_PATH = "mobilenetv2.tflite"
+MARKER_DIR = "markers"
+TEMP_DIR = "temp"
+ANIMATIONS = {
+    "Shree_Ganesh_Marker_01.jpg": "https://assets6.lottiefiles.com/packages/lf20_jsgzvgrn.json",
+    "Shree_Ganesh_Marker_02.jpg": "https://assets10.lottiefiles.com/packages/lf20_ydo1amjm.json"
+}
+
+# Ensure temp directory exists
+os.makedirs(TEMP_DIR, exist_ok=True)
+
 # Load TFLite model
-interpreter = tf.lite.Interpreter(model_path="mobilenetv2.tflite")
+interpreter = tf.lite.Interpreter(model_path=MODEL_PATH)
 interpreter.allocate_tensors()
 input_details = interpreter.get_input_details()
 output_details = interpreter.get_output_details()
 
-# Function to extract feature vector from image
-def extract_features(image: Image.Image) -> np.ndarray:
+# Load and process marker images
+def preprocess(image: Image.Image):
     image = image.resize((224, 224))
-    image = np.array(image).astype(np.float32)
-    image = image / 127.5 - 1.0  # Normalize to [-1, 1]
-    image = np.expand_dims(image, axis=0)
+    array = np.array(image).astype(np.float32)
+    array = array / 255.0
+    return np.expand_dims(array, axis=0)
 
-    interpreter.set_tensor(input_details[0]['index'], image)
+def extract_feature(img: Image.Image):
+    input_tensor = preprocess(img)
+    interpreter.set_tensor(input_details[0]['index'], input_tensor)
     interpreter.invoke()
-    output_data = interpreter.get_tensor(output_details[0]['index'])[0]
-    norm = np.linalg.norm(output_data)
-    if norm == 0:
-        return output_data
-    return output_data / norm
+    output_data = interpreter.get_tensor(output_details[0]['index'])
+    return output_data[0]
 
-# Load all markers from markers folder
-MARKERS_DIR = "markers"
-marker_features = {}
-marker_images = {}
+marker_vectors = []
+marker_names = []
 
-for file in os.listdir(MARKERS_DIR):
-    if file.lower().endswith(('.png', '.jpg', '.jpeg')):
-        path = os.path.join(MARKERS_DIR, file)
-        with Image.open(path).convert("RGB") as img:
-            vec = extract_features(img)
-            marker_features[file] = vec
-            marker_images[file] = path
-        print(f"Loaded marker: {file}")
+for filename in os.listdir(MARKER_DIR):
+    if filename.lower().endswith(('.jpg', '.jpeg', '.png')):
+        image_path = os.path.join(MARKER_DIR, filename)
+        with Image.open(image_path).convert('RGB') as img:
+            vec = extract_feature(img)
+            marker_vectors.append(vec)
+            marker_names.append(filename)
 
-@app.get("/markers")
-def get_marker_images():
-    return JSONResponse([f"/marker_image/{name}" for name in marker_images.keys()])
-
-@app.get("/marker_image/{filename}")
-def get_marker_image(filename: str):
-    path = marker_images.get(filename)
-    if path and os.path.exists(path):
-        return FileResponse(path)
-    return JSONResponse({"error": "Image not found"}, status_code=404)
+if marker_vectors:
+    marker_vectors = np.array(marker_vectors).astype(np.float32)
+    index = faiss.IndexFlatL2(marker_vectors.shape[1])
+    index.add(marker_vectors)
 
 @app.post("/")
-async def match_marker(file: UploadFile = File(...)):
+async def match_image(file: UploadFile = File(...)):
     try:
-        # Save uploaded frame
-        frame_id = str(uuid.uuid4())[:8]
-        saved_path = f"received_frames/frame_{frame_id}.jpg"
-        os.makedirs("received_frames", exist_ok=True)
-        with open(saved_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
+        contents = await file.read()
+        filename = f"input_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
+        temp_path = os.path.join(TEMP_DIR, filename)
 
-        with Image.open(saved_path).convert("RGB") as img:
-            input_vector = extract_features(img)
+        with open(temp_path, "wb") as f:
+            f.write(contents)
 
-        best_match = None
-        best_similarity = -1
-        threshold = 0.85
+        image = Image.open(temp_path).convert("RGB")
+        vec = extract_feature(image).astype(np.float32)
 
-        for name, marker_vector in marker_features.items():
-            similarity = np.dot(input_vector, marker_vector)
-            print(f"Comparing with {name}, similarity: {similarity:.4f}")
-            print(f"Input Vector: {input_vector[:5]}... Marker Vector: {marker_vector[:5]}...")
-            if similarity > best_similarity:
-                best_similarity = similarity
-                best_match = name
+        if len(marker_vectors) == 0:
+            return JSONResponse(content={"error": "No marker vectors loaded."}, status_code=500)
 
-        if best_similarity >= threshold:
-            return JSONResponse({"match": best_match, "similarity": float(best_similarity)})
+        D, I = index.search(np.array([vec]), k=1)
+        best_match_idx = I[0][0]
+        distance = D[0][0]
+
+        print(f"Compared with {marker_names[best_match_idx]}, distance: {distance:.4f}")
+        print(f"Input vector: {vec[:5]}")
+        print(f"Marker vector: {marker_vectors[best_match_idx][:5]}")
+
+        if distance < 30.0:
+            return {
+                "marker_id": marker_names[best_match_idx],
+                "animation_url": ANIMATIONS.get(marker_names[best_match_idx], "")
+            }
         else:
-            return JSONResponse({"match": None, "similarity": float(best_similarity)})
-
+            return {"match": False}
     except Exception as e:
-        print("Error processing image:", e)
-        return JSONResponse({"error": str(e)}, status_code=500)
+        print(f"Error processing image: {e}")
+        return JSONResponse(content={"error": "Failed to process image."}, status_code=500)
+
+@app.get("/markers")
+def list_markers():
+    try:
+        files = [f for f in os.listdir(MARKER_DIR) if f.lower().endswith(('jpg', 'jpeg', 'png'))]
+        urls = [f"/markers/{name}" for name in files]
+        return {"markers": urls}
+    except Exception as e:
+        return JSONResponse(content={"error": str(e)}, status_code=500)
