@@ -77,7 +77,7 @@ async def match_marker(file: UploadFile = File(...)):
     distance = D[0][0]
 
     # Set threshold for match (adjust as needed)
-    if distance < 1.0:
+    if distance < 2.0:
         marker_id = marker_names[best_match_idx]
         animation_url = "https://assets2.lottiefiles.com/packages/lf20_puciaact.json"
         return {"marker_id": marker_id, "animation_url": animation_url}
