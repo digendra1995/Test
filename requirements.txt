@@ -4,3 +4,4 @@ pillow
 faiss-cpu
 tensorflow-cpu
 python-multipart
+scikit-learn
