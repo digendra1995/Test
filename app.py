@@ -1,15 +1,41 @@
 import os
+import io
 import torch
 import open_clip
+from PIL import Image
 from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
-from PIL import Image
-from sklearn.metrics.pairwise import cosine_similarity
+from starlette.responses import JSONResponse
 import numpy as np
-from io import BytesIO
+from sklearn.metrics.pairwise import cosine_similarity
 
+# Load the lightweight RN50 CLIP model
+device = "cuda" if torch.cuda.is_available() else "cpu"
+model, _, preprocess = open_clip.create_model_and_transforms("RN50", pretrained="openai", device=device)
+tokenizer = open_clip.get_tokenizer("RN50")
+
+# Directory to store markers
+MARKERS_DIR = "markers"
+os.makedirs(MARKERS_DIR, exist_ok=True)
+
+# Load all marker vectors
+marker_vectors = []
+marker_names = []
+
+for filename in os.listdir(MARKERS_DIR):
+    if filename.lower().endswith((".jpg", ".jpeg", ".png")):
+        path = os.path.join(MARKERS_DIR, filename)
+        image = preprocess(Image.open(path).convert("RGB")).unsqueeze(0).to(device)
+        with torch.no_grad():
+            marker_vector = model.encode_image(image)
+        marker_vectors.append(marker_vector.cpu().numpy())
+        marker_names.append(filename)
+
+if marker_vectors:
+    marker_vectors = np.vstack(marker_vectors)
+
+# FastAPI app
 app = FastAPI()
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -18,53 +44,35 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-device = "cuda" if torch.cuda.is_available() else "cpu"
-model, _, preprocess = open_clip.create_model_and_transforms('ViT-B-32', pretrained='laion2b_s34b_b79k')
-model.to(device)
-model.eval()
-
-# Load and preprocess marker images
-MARKER_FOLDER = "markers"
-MARKERS = []
-
-def load_markers():
-    global MARKERS
-    for filename in os.listdir(MARKER_FOLDER):
-        if filename.lower().endswith(('.jpg', '.jpeg', '.png')):
-            path = os.path.join(MARKER_FOLDER, filename)
-            image = preprocess(Image.open(path)).unsqueeze(0).to(device)
-            with torch.no_grad():
-                embedding = model.encode_image(image)
-            MARKERS.append({"filename": filename, "embedding": embedding.cpu().numpy()})
-
-load_markers()
-
 @app.post("/")
-async def match_image(file: UploadFile = File(...)):
+async def match_marker(file: UploadFile = File(...)):
     try:
-        contents = await file.read()
-        image = Image.open(BytesIO(contents)).convert("RGB")
-        input_tensor = preprocess(image).unsqueeze(0).to(device)
+        image = Image.open(io.BytesIO(await file.read())).convert("RGB")
+        image = image.resize((224, 224))  # Reduce size to save memory
+        image_tensor = preprocess(image).unsqueeze(0).to(device)
 
         with torch.no_grad():
-            input_embedding = model.encode_image(input_tensor).cpu().numpy()
+            input_vector = model.encode_image(image_tensor).cpu().numpy()
 
-        best_match = None
-        best_distance = float("inf")
+        # Compare with loaded markers
+        if marker_vectors is not None:
+            similarities = cosine_similarity(input_vector, marker_vectors)[0]
+            best_idx = int(np.argmax(similarities))
+            best_score = float(similarities[best_idx])
 
-        for marker in MARKERS:
-            distance = 1 - cosine_similarity(input_embedding, marker["embedding"])[0][0]  # cosine distance
-            print(f"Compared with {marker['filename']}, distance: {distance:.4f}")
-            if distance < best_distance:
-                best_distance = distance
-                best_match = marker
+            print(f"Compared with {marker_names[best_idx]}, similarity: {best_score:.4f}")
+            print(f"Input vector (first 5): {input_vector[0][:5]}")
+            print(f"Marker vector (first 5): {marker_vectors[best_idx][:5]}")
 
-        # Set a matching threshold
-        if best_distance < 0.3:  # Adjust as needed
-            return {"matched": True, "marker": best_match["filename"], "distance": best_distance}
-        else:
-            return {"matched": False, "distance": best_distance}
+            match = best_score > 0.30  # Adjust threshold as needed
+            return JSONResponse({
+                "match": match,
+                "marker": marker_names[best_idx] if match else None,
+                "similarity": round(best_score, 4)
+            })
+
+        return JSONResponse({"error": "No marker vectors loaded."}, status_code=500)
 
     except Exception as e:
         print("Error processing image:", e)
-        return {"error": str(e)}
+        return JSONResponse({"error": str(e)}, status_code=500)
