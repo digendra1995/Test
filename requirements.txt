@@ -1,6 +1,6 @@
+open-clip-torch
+torch
 fastapi
 uvicorn
 pillow
-torch
 scikit-learn
-open-clip-torch
