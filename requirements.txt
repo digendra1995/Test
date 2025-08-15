@@ -1,7 +1,6 @@
 fastapi
 uvicorn
-pillow
-faiss-cpu
-tensorflow-cpu
-python-multipart
+Pillow
 scikit-learn
+torch
+open-clip-torch

@@ -1,15 +1,20 @@
+import os
+import io
+from datetime import datetime
+from typing import Dict
+
 from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
-from starlette.responses import JSONResponse
-import numpy as np
-import tensorflow as tf
 from PIL import Image
-import os
-import uuid
 from sklearn.metrics.pairwise import cosine_similarity
+import torch
+import open_clip
+from torchvision import transforms
 
+# App init
 app = FastAPI()
 
+# CORS for frontend access
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -18,79 +23,84 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-MODEL_PATH = "mobilenetv2.tflite"
-MARKER_FOLDER = "markers"
-TEMP_INPUTS = "inputs"
-os.makedirs(TEMP_INPUTS, exist_ok=True)
+# Create folders if not exist
+os.makedirs("inputs", exist_ok=True)
+os.makedirs("logs", exist_ok=True)
+os.makedirs("markers", exist_ok=True)
 
-interpreter = tf.lite.Interpreter(model_path=MODEL_PATH)
-interpreter.allocate_tensors()
+# Load CLIP model
+model, _, preprocess = open_clip.create_model_and_transforms('ViT-B-32', pretrained='openai')
+device = "cuda" if torch.cuda.is_available() else "cpu"
+model = model.to(device)
+model.eval()
 
-input_details = interpreter.get_input_details()
-output_details = interpreter.get_output_details()
+# Load and encode all marker images
+marker_vectors: Dict[str, torch.Tensor] = {}
+def load_marker_vectors():
+    print("Loading marker vectors...")
+    for filename in os.listdir("markers"):
+        if filename.lower().endswith(('.jpg', '.jpeg', '.png')):
+            path = os.path.join("markers", filename)
+            image = Image.open(path).convert("RGB")
+            image_input = preprocess(image).unsqueeze(0).to(device)
+            with torch.no_grad():
+                vec = model.encode_image(image_input)
+                vec /= vec.norm(dim=-1, keepdim=True)
+                marker_vectors[filename] = vec.cpu().numpy()[0]
+    print(f"Loaded {len(marker_vectors)} markers.")
 
-IMG_SIZE = (224, 224)
+load_marker_vectors()
 
-def extract_vector(image: Image.Image):
-    image = image.resize(IMG_SIZE).convert('RGB')
-    img_array = np.array(image).astype(np.float32) / 255.0
-    input_data = np.expand_dims(img_array, axis=0)
-
-    interpreter.set_tensor(input_details[0]['index'], input_data)
-    interpreter.invoke()
-    output_data = interpreter.get_tensor(output_details[0]['index'])[0]
-
-    # Normalize the vector
-    norm = np.linalg.norm(output_data)
-    if norm != 0:
-        output_data = output_data / norm
-
-    return output_data
-
-# Load marker vectors
-marker_vectors = []
-marker_names = []
-print("Loading markers:")
-for file_name in os.listdir(MARKER_FOLDER):
-    if file_name.lower().endswith(('.jpg', '.jpeg', '.png')):
-        path = os.path.join(MARKER_FOLDER, file_name)
-        img = Image.open(path)
-        vec = extract_vector(img)
-        marker_vectors.append(vec)
-        marker_names.append(file_name)
-        print(f"Loaded {file_name}")
-
-marker_vectors = np.array(marker_vectors)
+# Helper to get image embedding
+def get_clip_vector(image: Image.Image):
+    image_input = preprocess(image).unsqueeze(0).to(device)
+    with torch.no_grad():
+        vec = model.encode_image(image_input)
+        vec /= vec.norm(dim=-1, keepdim=True)
+    return vec.cpu().numpy()[0]
 
 @app.post("/")
 async def match_marker(file: UploadFile = File(...)):
     try:
         contents = await file.read()
-        img = Image.open(tf.io.gfile.GFile(file.filename, 'rb') if hasattr(file, 'filename') else file.file)
+        img = Image.open(io.BytesIO(contents)).convert("RGB")
 
-        # Save input image for review
-        input_id = str(uuid.uuid4()) + ".jpg"
-        input_path = os.path.join(TEMP_INPUTS, input_id)
-        with open(input_path, 'wb') as f:
-            f.write(contents)
+        # Save input image for inspection
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        input_path = f"inputs/input_{timestamp}.jpg"
+        img.save(input_path)
 
-        vec = extract_vector(img)
+        # Get vector
+        input_vector = get_clip_vector(img)
 
-        # Compute cosine similarity
-        similarities = cosine_similarity([vec], marker_vectors)[0]
-        best_idx = int(np.argmax(similarities))
-        best_score = similarities[best_idx]
+        # Compare with markers
+        best_match = None
+        best_score = -1
 
-        # Log for debugging
-        print(f"Compared with {marker_names[best_idx]}, similarity: {best_score:.4f}")
-        print(f"Input vector (first 5): {vec[:5]}")
-        print(f"Marker vector (first 5): {marker_vectors[best_idx][:5]}")
+        for name, marker_vec in marker_vectors.items():
+            score = cosine_similarity([input_vector], [marker_vec])[0][0]
+            print(f"Compared with {name}, similarity: {score:.4f}")
 
-        if best_score > 0.85:
-            return {"matched": True, "marker_id": marker_names[best_idx]}
+            if score > best_score:
+                best_score = score
+                best_match = name
+
+        threshold = 0.85
+        matched = best_score >= threshold
+
+        if matched:
+            print(f"✅ Match found: {best_match} ({best_score:.4f})")
         else:
-            return {"matched": False}
+            print(f"❌ No match found. Closest: {best_match} ({best_score:.4f})")
+
+        return {
+            "matched": matched,
+            "marker": best_match if matched else None,
+            "score": round(float(best_score), 4),
+            "input_vector_preview": input_vector[:5].tolist(),
+            "marker_vector_preview": marker_vectors[best_match][:5].tolist() if best_match else []
+        }
 
     except Exception as e:
         print("Error processing image:", e)
-        return JSONResponse(status_code=500, content={"error": str(e)})
+        return {"error": str(e)}
