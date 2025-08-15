@@ -1,41 +1,15 @@
 import os
-import io
-import torch
-import open_clip
-from PIL import Image
+import uvicorn
+import numpy as np
 from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
-from starlette.responses import JSONResponse
-import numpy as np
-from sklearn.metrics.pairwise import cosine_similarity
+from PIL import Image
+import onnxruntime as ort
+import torchvision.transforms as transforms
 
-# Load the lightweight RN50 CLIP model
-device = "cuda" if torch.cuda.is_available() else "cpu"
-model, _, preprocess = open_clip.create_model_and_transforms("RN50", pretrained="openai", device=device)
-tokenizer = open_clip.get_tokenizer("RN50")
-
-# Directory to store markers
-MARKERS_DIR = "markers"
-os.makedirs(MARKERS_DIR, exist_ok=True)
-
-# Load all marker vectors
-marker_vectors = []
-marker_names = []
-
-for filename in os.listdir(MARKERS_DIR):
-    if filename.lower().endswith((".jpg", ".jpeg", ".png")):
-        path = os.path.join(MARKERS_DIR, filename)
-        image = preprocess(Image.open(path).convert("RGB")).unsqueeze(0).to(device)
-        with torch.no_grad():
-            marker_vector = model.encode_image(image)
-        marker_vectors.append(marker_vector.cpu().numpy())
-        marker_names.append(filename)
-
-if marker_vectors:
-    marker_vectors = np.vstack(marker_vectors)
-
-# FastAPI app
 app = FastAPI()
+
+# CORS for frontend
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -44,35 +18,63 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Load ONNX CLIP model
+onnx_model_path = "clip-vit-base-patch32.onnx"  # Make sure this is in your project
+session = ort.InferenceSession(onnx_model_path, providers=["CPUExecutionProvider"])
+
+# Load and preprocess marker images
+marker_folder = "markers"
+marker_vectors = []
+marker_names = []
+
+preprocess = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+    transforms.Normalize((0.48145466, 0.4578275, 0.40821073),
+                         (0.26862954, 0.26130258, 0.27577711))
+])
+
+def image_to_vector(img: Image.Image):
+    img_tensor = preprocess(img).unsqueeze(0).numpy().astype(np.float32)
+    ort_inputs = {session.get_inputs()[0].name: img_tensor}
+    ort_outs = session.run(None, ort_inputs)
+    vec = ort_outs[0][0]
+    return vec / np.linalg.norm(vec)
+
+# Preload marker vectors
+for fname in os.listdir(marker_folder):
+    if fname.lower().endswith((".jpg", ".png")):
+        img = Image.open(os.path.join(marker_folder, fname)).convert("RGB")
+        vector = image_to_vector(img)
+        marker_vectors.append(vector)
+        marker_names.append(fname)
+print(f"Loaded {len(marker_vectors)} markers.")
+
 @app.post("/")
-async def match_marker(file: UploadFile = File(...)):
+async def compare_image(file: UploadFile = File(...)):
     try:
-        image = Image.open(io.BytesIO(await file.read())).convert("RGB")
-        image = image.resize((224, 224))  # Reduce size to save memory
-        image_tensor = preprocess(image).unsqueeze(0).to(device)
+        img = Image.open(file.file).convert("RGB")
+        input_vec = image_to_vector(img)
 
-        with torch.no_grad():
-            input_vector = model.encode_image(image_tensor).cpu().numpy()
+        # Compare with all markers
+        best_match = None
+        best_score = -1
+        for idx, marker_vec in enumerate(marker_vectors):
+            score = np.dot(input_vec, marker_vec)  # Cosine similarity
+            if score > best_score:
+                best_score = score
+                best_match = marker_names[idx]
 
-        # Compare with loaded markers
-        if marker_vectors is not None:
-            similarities = cosine_similarity(input_vector, marker_vectors)[0]
-            best_idx = int(np.argmax(similarities))
-            best_score = float(similarities[best_idx])
+        matched = best_score > 0.75  # Threshold for match
 
-            print(f"Compared with {marker_names[best_idx]}, similarity: {best_score:.4f}")
-            print(f"Input vector (first 5): {input_vector[0][:5]}")
-            print(f"Marker vector (first 5): {marker_vectors[best_idx][:5]}")
-
-            match = best_score > 0.30  # Adjust threshold as needed
-            return JSONResponse({
-                "match": match,
-                "marker": marker_names[best_idx] if match else None,
-                "similarity": round(best_score, 4)
-            })
-
-        return JSONResponse({"error": "No marker vectors loaded."}, status_code=500)
+        return {
+            "matched": matched,
+            "marker": best_match if matched else None,
+            "score": float(best_score)
+        }
 
     except Exception as e:
-        print("Error processing image:", e)
-        return JSONResponse({"error": str(e)}, status_code=500)
+        return {"error": str(e)}
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=10000)
