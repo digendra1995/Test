@@ -3,7 +3,7 @@ from fastapi.responses import JSONResponse
 from PIL import Image
 from sklearn.metrics.pairwise import cosine_similarity
 import torch
-import clip
+import open_clip as clip
 import os
 import io
 
