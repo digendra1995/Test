@@ -1,15 +1,16 @@
 import os
-import uvicorn
-import numpy as np
-from fastapi import FastAPI, UploadFile, File
+import uuid
+from fastapi import FastAPI, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image
-import onnxruntime as ort
-import torchvision.transforms as transforms
+import torch
+import open_clip
+from sklearn.metrics.pairwise import cosine_similarity
+import numpy as np
 
 app = FastAPI()
 
-# CORS for frontend
+# Allow all CORS (frontend-friendly)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -18,63 +19,70 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Load ONNX CLIP model
-onnx_model_path = "clip-vit-base-patch32.onnx"  # Make sure this is in your project
-session = ort.InferenceSession(onnx_model_path, providers=["CPUExecutionProvider"])
+device = "cpu"
+model, _, preprocess = open_clip.create_model_and_transforms("RN50", pretrained="openai")
+tokenizer = open_clip.get_tokenizer("RN50")
+model.to(device).eval()
 
-# Load and preprocess marker images
-marker_folder = "markers"
+# Load marker vectors
+marker_dir = "markers"
 marker_vectors = []
-marker_names = []
 
-preprocess = transforms.Compose([
-    transforms.Resize((224, 224)),
-    transforms.ToTensor(),
-    transforms.Normalize((0.48145466, 0.4578275, 0.40821073),
-                         (0.26862954, 0.26130258, 0.27577711))
-])
+def encode_image(img: Image.Image):
+    img = img.convert("RGB")
+    img = preprocess(img).unsqueeze(0).to(device)
+    with torch.no_grad():
+        vec = model.encode_image(img)
+        vec /= vec.norm(dim=-1, keepdim=True)
+    return vec.cpu().numpy()
 
-def image_to_vector(img: Image.Image):
-    img_tensor = preprocess(img).unsqueeze(0).numpy().astype(np.float32)
-    ort_inputs = {session.get_inputs()[0].name: img_tensor}
-    ort_outs = session.run(None, ort_inputs)
-    vec = ort_outs[0][0]
-    return vec / np.linalg.norm(vec)
-
-# Preload marker vectors
-for fname in os.listdir(marker_folder):
-    if fname.lower().endswith((".jpg", ".png")):
-        img = Image.open(os.path.join(marker_folder, fname)).convert("RGB")
-        vector = image_to_vector(img)
-        marker_vectors.append(vector)
-        marker_names.append(fname)
-print(f"Loaded {len(marker_vectors)} markers.")
+for filename in os.listdir(marker_dir):
+    if filename.lower().endswith((".png", ".jpg", ".jpeg")):
+        path = os.path.join(marker_dir, filename)
+        img = Image.open(path)
+        vec = encode_image(img)
+        marker_vectors.append((filename, vec))
+        print(f"Loaded marker: {filename}")
 
 @app.post("/")
-async def compare_image(file: UploadFile = File(...)):
+async def match_image(file: UploadFile = File(...)):
     try:
-        img = Image.open(file.file).convert("RGB")
-        input_vec = image_to_vector(img)
+        contents = await file.read()
+        temp_path = f"temp_{uuid.uuid4()}.jpg"
+        with open(temp_path, "wb") as f:
+            f.write(contents)
 
-        # Compare with all markers
+        img = Image.open(temp_path).convert("RGB")
+        input_vec = encode_image(img)
+
+        os.remove(temp_path)
+
         best_match = None
         best_score = -1
-        for idx, marker_vec in enumerate(marker_vectors):
-            score = np.dot(input_vec, marker_vec)  # Cosine similarity
+
+        for marker_name, marker_vec in marker_vectors:
+            score = cosine_similarity(input_vec, marker_vec)[0][0]
+            print(f"Compared with {marker_name}, similarity: {score:.4f}")
+            print("Input vector:", input_vec[0][:5])
+            print("Marker vector:", marker_vec[0][:5])
+
             if score > best_score:
                 best_score = score
-                best_match = marker_names[idx]
+                best_match = marker_name
 
-        matched = best_score > 0.75  # Threshold for match
-
-        return {
-            "matched": matched,
-            "marker": best_match if matched else None,
-            "score": float(best_score)
-        }
+        THRESHOLD = 0.90  # Tune this
+        if best_score >= THRESHOLD:
+            return {
+                "match": True,
+                "marker": best_match,
+                "score": float(best_score)
+            }
+        else:
+            return {
+                "match": False,
+                "score": float(best_score)
+            }
 
     except Exception as e:
+        print("Error processing image:", str(e))
         return {"error": str(e)}
-
-if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=10000)
